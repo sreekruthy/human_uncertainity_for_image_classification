@@ -53,6 +53,7 @@ def run_sanity_checks(soft_labels):
     2. Verify every soft label sums to 1
     3. Compute and report entropy statistics
     4. Count low and high disagreement images
+    5. Verify alignment with CIFAR-10 hard labels
     """
     print("\n" + "="*50)
     print("SANITY CHECKS")
@@ -84,8 +85,23 @@ def run_sanity_checks(soft_labels):
     high = (entropy > 2.0).sum()
     print(f"[OK] Low disagreement  (entropy < 0.5): {low} images")
     print(f"[OK] High disagreement (entropy > 2.0): {high} images")
-    print("="*50 + "\n")
 
+    # Check 5: Alignment — argmax of soft labels should match
+    # CIFAR-10 hard labels for majority of images
+    # This verifies CIFAR-10H is correctly aligned with CIFAR-10 images
+    base = datasets.CIFAR10(
+        root="./data", train=False,
+        download=True, transform=test_transform
+    )
+    hard_labels = np.array(base.targets)
+    soft_argmax = np.argmax(soft_labels, axis=1)
+    agreement   = (soft_argmax == hard_labels).mean()
+    print(f"[OK] Soft/Hard label alignment: "
+          f"{agreement*100:.1f}% agreement")
+    assert agreement > 0.85, \
+        f"Alignment too low: {agreement:.2f} — data may be misaligned!"
+
+    print("="*50 + "\n")
     return entropy
 
 # ── Dataset Classes ───────────────────────────────────────────────────────────
@@ -96,14 +112,14 @@ class CIFAR10SoftDataset(Dataset):
     - soft_label : 10-dim human annotator distribution from CIFAR-10H
     - hard_label : argmax of soft distribution (majority vote label)
     """
-    def __init__(self, cifar10_dataset, soft_labels):
+    def _init_(self, cifar10_dataset, soft_labels):
         self.data = cifar10_dataset
         self.soft = soft_labels
 
-    def __len__(self):
+    def _len_(self):
         return len(self.data)
 
-    def __getitem__(self, idx):
+    def _getitem_(self, idx):
         img, _     = self.data[idx]
         soft_label = torch.tensor(self.soft[idx], dtype=torch.float32)
         hard_label = int(np.argmax(self.soft[idx]))
@@ -117,14 +133,14 @@ class CIFAR10HardDataset(Dataset):
     - soft_label : 10-dim human annotator distribution from CIFAR-10H
     - hard_label : original CIFAR-10 ground truth label (one-hot baseline)
     """
-    def __init__(self, cifar10_dataset, soft_labels):
+    def _init_(self, cifar10_dataset, soft_labels):
         self.data = cifar10_dataset
         self.soft = soft_labels
 
-    def __len__(self):
+    def _len_(self):
         return len(self.data)
 
-    def __getitem__(self, idx):
+    def _getitem_(self, idx):
         img, hard_label = self.data[idx]
         soft_label      = torch.tensor(self.soft[idx], dtype=torch.float32)
         return img, soft_label, hard_label
