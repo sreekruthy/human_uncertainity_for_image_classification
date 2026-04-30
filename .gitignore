@@ -1,0 +1,14 @@
+# Data & weights (too large for git)
+*.npy
+checkpoints/
+data/
+
+# Results (optional — gitignore if plots are large)
+results/*.png
+results/*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
