@@ -112,14 +112,14 @@ class CIFAR10SoftDataset(Dataset):
     - soft_label : 10-dim human annotator distribution from CIFAR-10H
     - hard_label : argmax of soft distribution (majority vote label)
     """
-    def _init_(self, cifar10_dataset, soft_labels):
+    def __init__(self, cifar10_dataset, soft_labels):
         self.data = cifar10_dataset
         self.soft = soft_labels
 
-    def _len_(self):
+    def __len__(self):
         return len(self.data)
 
-    def _getitem_(self, idx):
+    def __getitem__(self, idx):
         img, _     = self.data[idx]
         soft_label = torch.tensor(self.soft[idx], dtype=torch.float32)
         hard_label = int(np.argmax(self.soft[idx]))
@@ -133,14 +133,14 @@ class CIFAR10HardDataset(Dataset):
     - soft_label : 10-dim human annotator distribution from CIFAR-10H
     - hard_label : original CIFAR-10 ground truth label (one-hot baseline)
     """
-    def _init_(self, cifar10_dataset, soft_labels):
+    def __init__(self, cifar10_dataset, soft_labels):
         self.data = cifar10_dataset
         self.soft = soft_labels
 
-    def _len_(self):
+    def __len__(self):
         return len(self.data)
 
-    def _getitem_(self, idx):
+    def __getitem__(self, idx):
         img, hard_label = self.data[idx]
         soft_label      = torch.tensor(self.soft[idx], dtype=torch.float32)
         return img, soft_label, hard_label
