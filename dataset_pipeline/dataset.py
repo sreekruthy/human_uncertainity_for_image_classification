@@ -6,7 +6,9 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import datasets, transforms
 from sklearn.model_selection import KFold
 
-# ── Normalization constants ───────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
+NUM_CLASSES = 10
+
 MEAN = (0.4914, 0.4822, 0.4465)
 STD  = (0.2023, 0.1994, 0.2010)
 
@@ -24,253 +26,304 @@ test_transform = transforms.Compose([
 ])
 
 # ── Download CIFAR-10H ────────────────────────────────────────────────────────
-def download_cifar10h(save_path="cifar10h-probs.npy"):
-    if os.path.exists(save_path):
-        print("CIFAR-10H already downloaded.")
-        return save_path
-    url = "https://github.com/jcpeterson/cifar-10h/raw/master/data/cifar10h-probs.npy"
-    print("Downloading CIFAR-10H...")
-    r = requests.get(url)
-    with open(save_path, "wb") as f:
-        f.write(r.content)
-    print("Done.")
-    return save_path
+def download_cifar10h(root="./data"):
+    """
+    Downloads cifar10h-probs.npy if not present and returns it as an ndarray.
+    Shape: (10000, 10) — one probability distribution per CIFAR-10 test image.
+    """
+    os.makedirs(root, exist_ok=True)
+    file_path = os.path.join(root, "cifar10h-probs.npy")
 
-# ── Entropy Computation ───────────────────────────────────────────────────────
+    if not os.path.exists(file_path):
+        url = (
+            "https://github.com/jcpeterson/cifar-10h/raw/master/"
+            "data/cifar10h-probs.npy"
+        )
+        print("[INFO] Downloading CIFAR-10H...")
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        with open(file_path, "wb") as f:
+            f.write(r.content)
+        print("[INFO] Download complete.")
+    else:
+        print("[INFO] CIFAR-10H already downloaded.")
+
+    return np.load(file_path)
+
+# ── Entropy ───────────────────────────────────────────────────────────────────
 def compute_entropy(soft_labels):
     """
-    Shannon entropy H(p) = -sum(p * log2(p)) for each image.
-    Range: 0 (perfect agreement) to log2(10)=3.32 (maximum disagreement).
+    Shannon entropy H(p) = -sum(p * log2(p)) per image.
+    Range: 0 (full agreement) → log2(10) ≈ 3.32 (maximum disagreement).
     """
     p = np.clip(soft_labels, 1e-10, 1.0)
     return -np.sum(p * np.log2(p), axis=1)
 
 # ── Sanity Checks ─────────────────────────────────────────────────────────────
-def run_sanity_checks(soft_labels):
+def run_sanity_checks(soft_labels, root="./data"):
     """
-    Required sanity checks from project specification:
-    1. Verify shape is (10000, 10)
-    2. Verify every soft label sums to 1
-    3. Compute and report entropy statistics
-    4. Count low and high disagreement images
-    5. Verify alignment with CIFAR-10 hard labels
+    Runs five required checks (from project specification):
+      1. Shape is (10000, 10)
+      2. Every soft label sums to 1
+      3. Entropy statistics (mean/std/min/max)
+      4. Low (<0.5) and high (>2.0) disagreement counts
+      5. Soft argmax vs CIFAR-10 hard label alignment (>85%)
+    Returns entropy array for downstream use.
     """
-    print("\n" + "="*50)
-    print("SANITY CHECKS")
-    print("="*50)
+    print("\n" + "=" * 55)
+    print("SANITY CHECKS — CIFAR-10H")
+    print("=" * 55)
 
-    # Check 1: Shape
+    # 1. Shape
     assert soft_labels.shape == (10000, 10), \
         f"Shape mismatch! Expected (10000,10), got {soft_labels.shape}"
     print(f"[OK] Shape: {soft_labels.shape}")
 
-    # Check 2: Sums to 1
+    # 2. Sums to 1
     sums = soft_labels.sum(axis=1)
     assert np.allclose(sums, 1.0, atol=1e-5), \
         "Some soft labels do not sum to 1!"
-    print(f"[OK] All soft labels sum to 1 "
+    print(f"[OK] All soft labels sum to 1  "
           f"(min={sums.min():.6f}, max={sums.max():.6f})")
 
-    # Check 3: Entropy statistics
+    # 3. Entropy stats
     entropy = compute_entropy(soft_labels)
     print(f"[OK] Entropy stats:")
-    print(f"     Mean  : {entropy.mean():.4f}")
-    print(f"     Std   : {entropy.std():.4f}")
-    print(f"     Min   : {entropy.min():.4f}")
-    print(f"     Max   : {entropy.max():.4f}")
-    print(f"     Max possible (uniform): {np.log2(10):.4f}")
+    print(f"       Mean : {entropy.mean():.4f}")
+    print(f"       Std  : {entropy.std():.4f}")
+    print(f"       Min  : {entropy.min():.4f}")
+    print(f"       Max  : {entropy.max():.4f}")
+    print(f"       Max possible (uniform) : {np.log2(10):.4f}")
 
-    # Check 4: Low vs high disagreement counts
-    low  = (entropy < 0.5).sum()
-    high = (entropy > 2.0).sum()
-    print(f"[OK] Low disagreement  (entropy < 0.5): {low} images")
-    print(f"[OK] High disagreement (entropy > 2.0): {high} images")
+    # 4. Disagreement counts
+    low_dis  = (entropy < 0.5).sum()
+    high_dis = (entropy > 2.0).sum()
+    print(f"[OK] Low  disagreement (entropy < 0.5) : {low_dis:5d} images")
+    print(f"[OK] High disagreement (entropy > 2.0) : {high_dis:5d} images")
 
-    # Check 5: Alignment — argmax of soft labels should match
-    # CIFAR-10 hard labels for majority of images
-    # This verifies CIFAR-10H is correctly aligned with CIFAR-10 images
+    # 5. Alignment with CIFAR-10 hard labels
     base = datasets.CIFAR10(
-        root="./data", train=False,
-        download=True, transform=test_transform
+        root=root, train=False, download=True, transform=test_transform
     )
     hard_labels = np.array(base.targets)
     soft_argmax = np.argmax(soft_labels, axis=1)
     agreement   = (soft_argmax == hard_labels).mean()
-    print(f"[OK] Soft/Hard label alignment: "
-          f"{agreement*100:.1f}% agreement")
+    print(f"[OK] Soft-argmax / hard-label agreement : {agreement * 100:.1f}%")
     assert agreement > 0.85, \
-        f"Alignment too low: {agreement:.2f} — data may be misaligned!"
+        f"Alignment too low ({agreement:.2f}) — data may be misaligned!"
 
-    print("="*50 + "\n")
+    print("=" * 55 + "\n")
     return entropy
 
 # ── Dataset Classes ───────────────────────────────────────────────────────────
+
 class CIFAR10SoftDataset(Dataset):
     """
-    PyTorch Dataset that returns (img, soft_label, hard_label).
-    - img        : normalised 32x32 tensor
-    - soft_label : 10-dim human annotator distribution from CIFAR-10H
-    - hard_label : argmax of soft distribution (majority vote label)
+    Returns (img, soft_label, hard_label) using CIFAR-10H soft labels.
+
+    Used for the SOFT-LABEL training condition (paper's main result).
+      img        : normalised 32×32 tensor
+      soft_label : 10-dim human annotator probability distribution
+      hard_label : original CIFAR-10 ground-truth integer label
     """
-    def __init__(self, cifar10_dataset, soft_labels):
-        self.data = cifar10_dataset
-        self.soft = soft_labels
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        img, _     = self.data[idx]
-        soft_label = torch.tensor(self.soft[idx], dtype=torch.float32)
-        hard_label = int(np.argmax(self.soft[idx]))
-        return img, soft_label, hard_label
-
-
-class CIFAR10HardDataset(Dataset):
-    """
-    PyTorch Dataset that returns (img, soft_label, hard_label).
-    - img        : normalised 32x32 tensor
-    - soft_label : 10-dim human annotator distribution from CIFAR-10H
-    - hard_label : original CIFAR-10 ground truth label (one-hot baseline)
-    """
-    def __init__(self, cifar10_dataset, soft_labels):
-        self.data = cifar10_dataset
-        self.soft = soft_labels
+    def __init__(self, cifar10_dataset, soft_labels, transform=None):
+        self.data      = cifar10_dataset
+        self.soft      = soft_labels          # shape (10000, 10)
+        self.transform = transform
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         img, hard_label = self.data[idx]
-        soft_label      = torch.tensor(self.soft[idx], dtype=torch.float32)
-        return img, soft_label, hard_label
+        if self.transform:
+            img = self.transform(img)
+        soft_label = torch.tensor(self.soft[idx], dtype=torch.float32)
+        return img, soft_label, int(hard_label)
 
 
-# ── Fixed Split (Project Specification) ──────────────────────────────────────
-def get_split_indices(n=10000, train=6000, val=2000, test=2000, seed=42):
+class CIFAR10HardDataset(Dataset):
     """
-    Returns fixed train/val/test indices.
-    Split: 6000 train / 2000 val / 2000 test
-    Fixed random seed=42 for full reproducibility.
+    Returns (img, one_hot_label, hard_label) using CIFAR-10 hard labels ONLY.
+
+    Used for the HARD-LABEL baseline condition (control in paper).
+      img        : normalised 32×32 tensor
+      soft_label : one-hot 10-dim vector (no soft information)
+      hard_label : original CIFAR-10 ground-truth integer label
     """
-    assert train + val + test == n, "Split sizes must sum to 10000"
-    rng       = np.random.default_rng(seed)
-    indices   = rng.permutation(n)
-    train_idx = indices[:train]
-    val_idx   = indices[train:train+val]
-    test_idx  = indices[train+val:]
-    return train_idx, val_idx, test_idx
+    def __init__(self, cifar10_dataset, transform=None):
+        self.data      = cifar10_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img, hard_label = self.data[idx]
+        if self.transform:
+            img = self.transform(img)
+        one_hot = torch.zeros(NUM_CLASSES)
+        one_hot[hard_label] = 1.0
+        return img, one_hot, int(hard_label)
 
 
-# ── Public API — Split Loaders ────────────────────────────────────────────────
-def get_split_loaders(batch_size=128):
+# ── Public API — K-Fold Loaders (Paper Protocol) ──────────────────────────────
+def get_kfold_loaders(
+        root="./data",
+        k=10,
+        batch_size=128,
+        use_soft_labels=True,
+        seed=42
+):
     """
-    Returns (train_loader, val_loader, test_loader) using the
-    6000/2000/2000 split specified in the project document.
-    Fixed seed=42 for reproducibility.
-    """
-    soft_labels = np.load(download_cifar10h())
+    Returns list of (train_loader, val_loader) tuples for k-fold CV.
 
+    Follows Peterson et al. §5.1 exactly:
+      - 10-fold CV on 10,000 CIFAR-10H test images
+      - 9,000 train / 1,000 val per fold
+      - Fixed random_state=42 for reproducibility
+      - Both soft and hard conditions train on the SAME 10k image pool
+        (the fair apples-to-apples comparison the paper makes)
+
+    Args:
+        root            : data directory
+        k               : number of folds (paper uses 10)
+        batch_size      : mini-batch size
+        use_soft_labels : True → CIFAR10SoftDataset, False → CIFAR10HardDataset
+        seed            : KFold random state
+
+    Returns:
+        List of k (train_loader, val_loader) tuples.
+    """
+    soft_labels = download_cifar10h(root)
+
+    # Both conditions use CIFAR-10 *test* set (10k images) —
+    # the same pool that CIFAR-10H annotations cover.
     base_train = datasets.CIFAR10(
-        root="./data", train=False,
-        download=True, transform=train_transform
-    )
-    base_test = datasets.CIFAR10(
-        root="./data", train=False,
-        download=True, transform=test_transform
-    )
-
-    train_idx, val_idx, test_idx = get_split_indices()
-
-    train_ds = Subset(CIFAR10SoftDataset(base_train, soft_labels), train_idx)
-    val_ds   = Subset(CIFAR10SoftDataset(base_test,  soft_labels), val_idx)
-    test_ds  = Subset(CIFAR10SoftDataset(base_test,  soft_labels), test_idx)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size,
-                              shuffle=True,  num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size,
-                              shuffle=False, num_workers=0)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size,
-                              shuffle=False, num_workers=0)
-
-    return train_loader, val_loader, test_loader
-
-
-# ── Public API — K-Fold Loaders (Paper Specification) ────────────────────────
-def get_kfold_loaders(fold_idx, batch_size=128):
-    """
-    Returns (train_loader, val_loader) for the given fold (0-9).
-    10-fold CV: 9000 train / 1000 val per fold.
-    Exactly as described in the paper (Peterson et al., ICCV 2019).
-    Fixed random_state=42 for reproducibility.
-    Used by Member 3 training pipeline.
-    """
-    soft_labels = np.load(download_cifar10h())
-
-    base_train = datasets.CIFAR10(
-        root="./data", train=False,
-        download=True, transform=train_transform
+        root=root, train=False, download=True, transform=None
     )
     base_val = datasets.CIFAR10(
-        root="./data", train=False,
-        download=True, transform=test_transform
+        root=root, train=False, download=True, transform=None
     )
 
-    soft_ds_train = CIFAR10SoftDataset(base_train, soft_labels)
-    soft_ds_val   = CIFAR10SoftDataset(base_val,   soft_labels)
+    kf      = KFold(n_splits=k, shuffle=True, random_state=seed)
+    indices = np.arange(10000)
+    loaders = []
 
-    kf     = KFold(n_splits=10, shuffle=True, random_state=42)
-    splits = list(kf.split(range(10000)))
-    train_idx, val_idx = splits[fold_idx]
+    for fold_idx, (train_idx, val_idx) in enumerate(kf.split(indices)):
+        train_idx = train_idx.tolist()
+        val_idx   = val_idx.tolist()
 
-    train_loader = DataLoader(
-        Subset(soft_ds_train, train_idx),
-        batch_size=batch_size, shuffle=True, num_workers=0
-    )
-    val_loader = DataLoader(
-        Subset(soft_ds_val, val_idx),
-        batch_size=batch_size, shuffle=False, num_workers=0
-    )
-    return train_loader, val_loader
+        if use_soft_labels:
+            train_ds = Subset(
+                CIFAR10SoftDataset(base_train, soft_labels,
+                                   transform=train_transform),
+                train_idx
+            )
+            val_ds = Subset(
+                CIFAR10SoftDataset(base_val, soft_labels,
+                                   transform=test_transform),
+                val_idx
+            )
+        else:
+            # Hard-label baseline: one-hot from CIFAR-10 targets, no soft file
+            train_ds = Subset(
+                CIFAR10HardDataset(base_train, transform=train_transform),
+                train_idx
+            )
+            val_ds = Subset(
+                CIFAR10HardDataset(base_val, transform=test_transform),
+                val_idx
+            )
+
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,  num_workers=2,
+            pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_ds,   batch_size=batch_size, shuffle=False, num_workers=2,
+            pin_memory=True
+        )
+
+        loaders.append((train_loader, val_loader))
+        label_type = "soft" if use_soft_labels else "hard"
+        print(
+            f"[INFO] Fold {fold_idx + 1:02d}/{k} | "
+            f"{label_type} labels | "
+            f"Train={len(train_ds):5d} | Val={len(val_ds):4d}"
+        )
+
+    return loaders
 
 
-# ── Public API — Full Dataset ─────────────────────────────────────────────────
-def get_datasets(run_checks=True):
+def get_single_fold_loaders(fold_idx, root="./data", batch_size=128,
+                            use_soft_labels=True, seed=42):
     """
-    Returns (soft_dataset, hard_dataset) on the full 10k CIFAR-10H images.
-    Runs sanity checks if run_checks=True.
+    Convenience wrapper: returns (train_loader, val_loader) for one fold.
+    Called by training loop as:
+        train_loader, val_loader = get_single_fold_loaders(fold_idx)
     """
-    soft_labels = np.load(download_cifar10h())
+    loaders = get_kfold_loaders(root, k=10, batch_size=batch_size,
+                                 use_soft_labels=use_soft_labels, seed=seed)
+    return loaders[fold_idx]
 
+
+# ── Public API — Full Datasets (for Member 4 evaluation) ─────────────────────
+def get_datasets(root="./data", run_checks=True):
+    """
+    Returns (soft_dataset, hard_dataset) on all 10,000 CIFAR-10H images.
+    Useful for Member 4's evaluation and entropy-based analysis.
+    """
+    soft_labels = download_cifar10h(root)
     if run_checks:
-        run_sanity_checks(soft_labels)
+        run_sanity_checks(soft_labels, root)
 
-    base_test = datasets.CIFAR10(
-        root="./data", train=False,
-        download=True, transform=test_transform
+    base = datasets.CIFAR10(
+        root=root, train=False, download=True, transform=test_transform
     )
-
-    soft_ds = CIFAR10SoftDataset(base_test, soft_labels)
-    hard_ds = CIFAR10HardDataset(base_test, soft_labels)
+    soft_ds = CIFAR10SoftDataset(base, soft_labels)
+    hard_ds = CIFAR10HardDataset(base)
     return soft_ds, hard_ds
 
 
-# ── Public API — Test Loader ──────────────────────────────────────────────────
-def get_test_loader(batch_size=128):
-    """Standard CIFAR-10 test set loader (hard labels only)."""
+# ── Public API — Standard CIFAR-10 Test Loader (for Member 4) ────────────────
+def get_test_loader(root="./data", batch_size=128):
+    """Standard CIFAR-10 test set with hard labels (for accuracy evaluation)."""
     test_ds = datasets.CIFAR10(
-        root="./data", train=False,
-        download=True, transform=test_transform
+        root=root, train=False, download=True, transform=test_transform
     )
-    return DataLoader(test_ds, batch_size=batch_size,
-                      shuffle=False, num_workers=0)
+    return DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False,
+        num_workers=2, pin_memory=True
+    )
 
 
-# ── Public API — Entropy Stats ────────────────────────────────────────────────
-def get_entropy_stats():
-    """
-    Returns entropy array for all 10k images.
-    Useful for plots and analysis in Member 4.
-    """
-    soft_labels = np.load(download_cifar10h())
+# ── Public API — Entropy Stats (for Member 4 plots) ──────────────────────────
+def get_entropy_stats(root="./data"):
+    """Returns entropy array for all 10k images. Used for Figure plots."""
+    soft_labels = download_cifar10h(root)
     return compute_entropy(soft_labels)
+
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # 1. Sanity checks
+    soft_labels = download_cifar10h()
+    entropy     = run_sanity_checks(soft_labels)
+
+    # 2. Smoke-test: build 2-fold loaders (quick, not the full 10)
+    print("--- Soft label 2-fold smoke test ---")
+    soft_loaders = get_kfold_loaders(k=2, batch_size=64, use_soft_labels=True)
+    imgs, soft, hard = next(iter(soft_loaders[0][0]))
+    print(f"  images : {tuple(imgs.shape)}")
+    print(f"  soft   : {tuple(soft.shape)}  sum={soft[0].sum():.4f}")
+    print(f"  hard   : {hard[:4].tolist()}")
+
+    print("--- Hard label 2-fold smoke test ---")
+    hard_loaders = get_kfold_loaders(k=2, batch_size=64, use_soft_labels=False)
+    imgs, one_hot, hard = next(iter(hard_loaders[0][0]))
+    print(f"  images : {tuple(imgs.shape)}")
+    print(f"  one_hot: {tuple(one_hot.shape)}  sum={one_hot[0].sum():.1f}")
+    print(f"  hard   : {hard[:4].tolist()}")
+
+    print("\nAll checks passed.")
