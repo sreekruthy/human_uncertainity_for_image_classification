@@ -1,0 +1,167 @@
+[
+    {
+        "model": "resnet20_linear_jsd_soft_best_acc",
+        "accuracy": 0.7535,
+        "cross_entropy": 1.1030837446451187,
+        "kl_divergence": 1.1302845478057861,
+        "jsd": 1.2962055169045925,
+        "cosine_similarity": 0.7900481428951025,
+        "pearson_r": 0.22576716542243958,
+        "spearman_r": 0.2271523483584677,
+        "precision_at_3": 0.5569661458333334
+    },
+    {
+        "model": "lightcnn_linear_jsd_soft_best",
+        "accuracy": 0.6905,
+        "cross_entropy": 1.1128587871789932,
+        "kl_divergence": 1.062380574643612,
+        "jsd": 1.6341677531599998,
+        "cosine_similarity": 0.7460533417761326,
+        "pearson_r": 0.2017744779586792,
+        "spearman_r": 0.19563223450657566,
+        "precision_at_3": 0.5449218750000001
+    },
+    {
+        "model": "resnet_basic_110_linear_kl_soft_best",
+        "accuracy": 0.6355,
+        "cross_entropy": 1.059790976345539,
+        "kl_divergence": 0.9757505096495152,
+        "jsd": 2.0811582133173943,
+        "cosine_similarity": 0.7080454844981432,
+        "pearson_r": 0.19046594202518463,
+        "spearman_r": 0.17209894131235728,
+        "precision_at_3": 0.5205078125000001
+    },
+    {
+        "model": "resnet20_linear_kl_soft_best_acc",
+        "accuracy": 0.7445,
+        "cross_entropy": 0.8106250567361712,
+        "kl_divergence": 0.7772199977189302,
+        "jsd": 1.3260458707809448,
+        "cosine_similarity": 0.7969682700932026,
+        "pearson_r": 0.24978876113891602,
+        "spearman_r": 0.26142697234962997,
+        "precision_at_3": 0.5613606770833335
+    },
+    {
+        "model": "resnet20_linear_jsd_soft_best",
+        "accuracy": 0.7565,
+        "cross_entropy": 1.0874133594334126,
+        "kl_divergence": 1.1113436724990606,
+        "jsd": 1.2715458162128925,
+        "cosine_similarity": 0.7937748376280069,
+        "pearson_r": 0.23531807959079742,
+        "spearman_r": 0.2359938395903044,
+        "precision_at_3": 0.5485026041666667
+    },
+    {
+        "model": "lightcnn_linear_kl_soft_best",
+        "accuracy": 0.7095,
+        "cross_entropy": 0.8696556240320206,
+        "kl_divergence": 0.7911019921302795,
+        "jsd": 1.7736675329506397,
+        "cosine_similarity": 0.7664562184363604,
+        "pearson_r": 0.22907483577728271,
+        "spearman_r": 0.20660622374362111,
+        "precision_at_3": 0.5540364583333334
+    },
+    {
+        "model": "resnet20_linear_entropy_penalty_soft_best_acc",
+        "accuracy": 0.7445,
+        "cross_entropy": 0.8380480073392391,
+        "kl_divergence": 0.8228311948478222,
+        "jsd": 1.3591760694980621,
+        "cosine_similarity": 0.7914514485746622,
+        "pearson_r": 0.24571757018566132,
+        "spearman_r": 0.2540129627832795,
+        "precision_at_3": 0.53369140625
+    },
+    {
+        "model": "lightcnn_linear_entropy_penalty_soft_best",
+        "accuracy": 0.7035,
+        "cross_entropy": 0.8702378831803799,
+        "kl_divergence": 0.793993997387588,
+        "jsd": 1.7168615199625492,
+        "cosine_similarity": 0.7669208664447069,
+        "pearson_r": 0.24209707975387573,
+        "spearman_r": 0.22286500406681775,
+        "precision_at_3": 0.5548502604166666
+    },
+    {
+        "model": "resnet20_linear_entropy_penalty_soft_best",
+        "accuracy": 0.7405,
+        "cross_entropy": 0.8254076112061739,
+        "kl_divergence": 0.797940393909812,
+        "jsd": 1.3517260272055864,
+        "cosine_similarity": 0.7915162947028875,
+        "pearson_r": 0.2276759147644043,
+        "spearman_r": 0.23997155375716403,
+        "precision_at_3": 0.5489908854166666
+    },
+    {
+        "model": "resnet_basic_110_linear_entropy_penalty_soft_best",
+        "accuracy": 0.564,
+        "cross_entropy": 1.4102307669818401,
+        "kl_divergence": 1.314769497141242,
+        "jsd": 2.454370390623808,
+        "cosine_similarity": 0.6338789016008377,
+        "pearson_r": 0.1272972822189331,
+        "spearman_r": 0.12935915014763802,
+        "precision_at_3": 0.5299479166666666
+    },
+    {
+        "model": "resnet20_linear_kl_soft_best",
+        "accuracy": 0.733,
+        "cross_entropy": 0.8124940721318126,
+        "kl_divergence": 0.7589249387383461,
+        "jsd": 1.4627986066043377,
+        "cosine_similarity": 0.7873242720961571,
+        "pearson_r": 0.24339398741722107,
+        "spearman_r": 0.25946333185779535,
+        "precision_at_3": 0.5509440104166666
+    },
+    {
+        "model": "lightcnn_linear_kl_soft_best_acc",
+        "accuracy": 0.707,
+        "cross_entropy": 0.8751420024782419,
+        "kl_divergence": 0.7979819690808654,
+        "jsd": 1.789539460092783,
+        "cosine_similarity": 0.7646817360073328,
+        "pearson_r": 0.21952608227729797,
+        "spearman_r": 0.19697793189011956,
+        "precision_at_3": 0.55224609375
+    },
+    {
+        "model": "lightcnn_linear_entropy_penalty_soft_best_acc",
+        "accuracy": 0.6955,
+        "cross_entropy": 0.8847968056797981,
+        "kl_divergence": 0.8070042096078396,
+        "jsd": 1.7439135797321796,
+        "cosine_similarity": 0.7633411176502705,
+        "pearson_r": 0.2430969774723053,
+        "spearman_r": 0.22706668007774525,
+        "precision_at_3": 0.5525716145833334
+    },
+    {
+        "model": "vgg16_bn_linear_kl_soft_best",
+        "accuracy": 0.793,
+        "cross_entropy": 0.6646591504104435,
+        "kl_divergence": 0.6008719254750758,
+        "jsd": 1.0577333075925708,
+        "cosine_similarity": 0.8334684930741787,
+        "pearson_r": 0.2989521026611328,
+        "spearman_r": 0.31228868981076724,
+        "precision_at_3": 0.5587565104166669
+    },
+    {
+        "model": "lightcnn_linear_jsd_soft_best_acc",
+        "accuracy": 0.6875,
+        "cross_entropy": 1.1113021429628134,
+        "kl_divergence": 1.0593862794339657,
+        "jsd": 1.6353131383657455,
+        "cosine_similarity": 0.7466881480067968,
+        "pearson_r": 0.19546641409397125,
+        "spearman_r": 0.19333898175896416,
+        "precision_at_3": 0.5462239583333333
+    }
+]
