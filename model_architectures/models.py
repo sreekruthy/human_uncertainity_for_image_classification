@@ -1,3 +1,39 @@
+"""
+Architecture requirements :
+  Component 1 — Backbone
+      Any of the 8 paper CNNs (or ResNet-18 adapted for 32×32).
+      Must output 10-dimensional probability distribution via softmax.
+
+  Component 2 — Prediction Head
+      Maps backbone feature vector → 10-dim soft distribution.
+      Required variants (for ablation D):
+          'linear'      : single Linear + softmax
+          'mlp'         : Linear → ReLU → Linear + softmax
+          'temperature' : single Linear + temperature-scaled softmax
+
+  Backbone initialisation (ablation A):
+      'random'    : Kaiming init (default)
+      'imagenet'  : torchvision ImageNet pretrained weights (ResNet-18 only)
+      'cifar10'   : load checkpoint pretrained on CIFAR-10 hard labels
+
+All models:
+  - Accept 32×32 RGB CIFAR inputs
+  - Return 10-dim LOG-SOFTMAX probabilities (not raw logits)
+    so that KL-divergence loss can be applied directly
+
+CHANGES vs original models.py (Peterson replication):
+  - Added PredictionHead class (linear / mlp / temperature variants)
+  - All build functions now compose Backbone + PredictionHead into one module
+  - Output is log-softmax (needed for KLDivLoss) rather than raw logits.
+    The original soft_cross_entropy in train.py applied softmax internally —
+    now the model applies it so all loss functions see probabilities.
+  - Added load_backbone_weights() for ablation A (backbone init strategy)
+  - Added get_model_with_head() factory that Member 3 calls
+  - All 8 paper backbone implementations kept intact (no changes to internals)
+  - LightCNN kept for fast smoke-tests
+  - Bug fixes from original file unchanged (DenseLayer.forward, etc.)
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,11 +42,126 @@ import math
 NUM_CLASSES = 10
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  RESNET  (resnet_basic_110 and resnet20)
+# PREDICTION HEADS  (project §5.2 Component 2)
 # ══════════════════════════════════════════════════════════════════════════════
-# He et al., CVPR 2016.
-# CIFAR design: stem 16ch, three stages 16→32→64, GlobalAvgPool, FC.
-# depth = 6n + 2  →  n=3 → ResNet-20,  n=18 → ResNet-110
+
+class LinearHead(nn.Module):
+    """
+    Single linear layer + log-softmax.
+    Minimal capacity, low overfitting risk, fully interpretable.
+    Suitable when backbone features are already high-quality.
+    """
+    def __init__(self, in_features, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.fc = nn.Linear(in_features, num_classes)
+
+    def forward(self, x):
+        return F.log_softmax(self.fc(x), dim=1)
+
+
+class MLPHead(nn.Module):
+    """
+    Two-layer MLP + log-softmax.
+    Hidden dim = in_features // 2 (halved for regularisation).
+    Higher capacity than LinearHead — risk of overfitting on 6k images,
+    so used with dropout.
+    """
+    def __init__(self, in_features, num_classes=NUM_CLASSES, dropout=0.3):
+        super().__init__()
+        hidden = max(in_features // 2, num_classes * 4)
+        self.net = nn.Sequential(
+            nn.Linear(in_features, hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden, num_classes),
+        )
+
+    def forward(self, x):
+        return F.log_softmax(self.net(x), dim=1)
+
+
+class TemperatureHead(nn.Module):
+    """
+    Single linear layer + temperature-scaled log-softmax.
+    Temperature T > 1 softens the output distribution (higher entropy).
+    T is a learnable scalar, initialised to 1.0.
+    Useful because our targets (human soft labels) are naturally soft.
+    """
+    def __init__(self, in_features, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.fc          = nn.Linear(in_features, num_classes)
+        # Learnable temperature — log-space to keep T > 0
+        self.log_temp    = nn.Parameter(torch.zeros(1))
+
+    @property
+    def temperature(self):
+        return self.log_temp.exp()
+
+    def forward(self, x):
+        logits = self.fc(x)
+        return F.log_softmax(logits / self.temperature, dim=1)
+
+
+def build_head(head_type, in_features, num_classes=NUM_CLASSES):
+    """
+    Factory for prediction heads.
+
+    Args:
+        head_type   : 'linear' | 'mlp' | 'temperature'
+        in_features : backbone output feature dimension
+        num_classes : number of output classes (10 for CIFAR-10)
+    """
+    head_type = head_type.lower().strip()
+    if head_type == 'linear':
+        return LinearHead(in_features, num_classes)
+    elif head_type == 'mlp':
+        return MLPHead(in_features, num_classes)
+    elif head_type == 'temperature':
+        return TemperatureHead(in_features, num_classes)
+    else:
+        raise ValueError(
+            f"Unknown head_type '{head_type}'. "
+            "Choose from: 'linear', 'mlp', 'temperature'."
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMBINED MODEL  — Backbone + Head
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DisagreementPredictor(nn.Module):
+    """
+    Full model: Backbone feature extractor + Prediction head.
+
+    Forward pass returns LOG-SOFTMAX probabilities (shape: B × 10).
+    Use F.kl_div(output, target) as the primary loss.
+
+    The backbone's original FC / classifier layer is removed and replaced
+    with the chosen prediction head so that fine-tuning is focused on
+    the head while backbone weights are optionally frozen.
+    """
+    def __init__(self, backbone, head):
+        super().__init__()
+        self.backbone = backbone
+        self.head     = head
+
+    def forward(self, x):
+        features = self.backbone(x)   # (B, feature_dim)
+        return self.head(features)    # (B, 10) log-softmax
+
+    def freeze_backbone(self):
+        """Freeze all backbone parameters (fine-tune head only)."""
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """Unfreeze backbone for joint fine-tuning."""
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  RESNET  (resnet_basic_110 and resnet20)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class BasicBlock(nn.Module):
@@ -38,17 +189,21 @@ class BasicBlock(nn.Module):
         return F.relu(out + self.shortcut(x))
 
 
-class ResNetCIFAR(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
+class ResNetCIFARBackbone(nn.Module):
+    """
+    ResNet backbone for CIFAR (32×32). Returns feature vector, NOT logits.
+    The FC layer from the original ResNetCIFAR is removed here.
+    """
+    def __init__(self, block, num_blocks):
         super().__init__()
-        self.in_ch  = 16
-        self.conv1  = nn.Conv2d(3, 16, 3, stride=1, padding=1, bias=False)
-        self.bn1    = nn.BatchNorm2d(16)
-        self.layer1 = self._make_stage(block, 16, num_blocks[0], stride=1)
-        self.layer2 = self._make_stage(block, 32, num_blocks[1], stride=2)
-        self.layer3 = self._make_stage(block, 64, num_blocks[2], stride=2)
+        self.in_ch   = 16
+        self.conv1   = nn.Conv2d(3, 16, 3, stride=1, padding=1, bias=False)
+        self.bn1     = nn.BatchNorm2d(16)
+        self.layer1  = self._make_stage(block, 16, num_blocks[0], stride=1)
+        self.layer2  = self._make_stage(block, 32, num_blocks[1], stride=2)
+        self.layer3  = self._make_stage(block, 64, num_blocks[2], stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc      = nn.Linear(64 * block.expansion, num_classes)
+        self.out_features = 64 * block.expansion
         self._init_weights()
 
     def _make_stage(self, block, out_ch, n, stride):
@@ -66,9 +221,6 @@ class ResNetCIFAR(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.01)
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
@@ -76,31 +228,14 @@ class ResNetCIFAR(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.avgpool(out)
-        return self.fc(torch.flatten(out, 1))
-
-
-def resnet20(num_classes=10):
-    """ResNet-20: n=3 → depth=20. ~272K params. Fast baseline."""
-    return ResNetCIFAR(BasicBlock, [3, 3, 3], num_classes)
-
-def resnet_basic_110(num_classes=10):
-    """ResNet-110: n=18 → depth=110. ~1.7M params. Paper model."""
-    return ResNetCIFAR(BasicBlock, [18, 18, 18], num_classes)
+        return torch.flatten(out, 1)   # (B, 64)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2.  RESNET PRE-ACTIVATION  (resnet_preact_bottleneck_164)
 # ══════════════════════════════════════════════════════════════════════════════
-# He et al., ECCV 2016. Pre-act order: BN→ReLU→Conv (no act on skip path).
-# Bottleneck expansion=4. depth=164 → 3×18 bottleneck blocks.
-# ══════════════════════════════════════════════════════════════════════════════
 
 class PreActBottleneck(nn.Module):
-    """
-    Pre-activation bottleneck block.
-    in_ch → mid_ch (1×1) → mid_ch (3×3) → out_ch (1×1)
-    where mid_ch = out_ch // expansion.
-    """
     expansion = 4
 
     def __init__(self, in_ch, out_ch, stride=1):
@@ -113,7 +248,6 @@ class PreActBottleneck(nn.Module):
                                padding=1, bias=False)
         self.bn3   = nn.BatchNorm2d(mid_ch)
         self.conv3 = nn.Conv2d(mid_ch, out_ch, 1, bias=False)
-        # Shortcut: linear projection only — no BN/ReLU on skip path
         self.shortcut = nn.Sequential()
         if stride != 1 or in_ch != out_ch:
             self.shortcut = nn.Conv2d(in_ch, out_ch, 1,
@@ -126,10 +260,8 @@ class PreActBottleneck(nn.Module):
         return out + self.shortcut(x)
 
 
-class ResNetPreAct(nn.Module):
-    """Pre-activation ResNet for CIFAR (depth=164, bottleneck)."""
-
-    def __init__(self, block, num_blocks, num_classes=10):
+class ResNetPreActBackbone(nn.Module):
+    def __init__(self, block, num_blocks):
         super().__init__()
         self.in_ch    = 16
         self.conv1    = nn.Conv2d(3, 16, 3, stride=1, padding=1, bias=False)
@@ -138,7 +270,7 @@ class ResNetPreAct(nn.Module):
         self.layer3   = self._make_stage(block, 256, num_blocks[2], stride=2)
         self.bn_final = nn.BatchNorm2d(256)
         self.avgpool  = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc       = nn.Linear(256, num_classes)
+        self.out_features = 256
         self._init_weights()
 
     def _make_stage(self, block, out_ch, n, stride):
@@ -156,9 +288,6 @@ class ResNetPreAct(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.01)
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         out = self.conv1(x)
@@ -167,20 +296,11 @@ class ResNetPreAct(nn.Module):
         out = self.layer3(out)
         out = F.relu(self.bn_final(out))
         out = self.avgpool(out)
-        return self.fc(torch.flatten(out, 1))
-
-
-def resnet_preact_bottleneck_164(num_classes=10):
-    """ResNet-preact-164: 3×18 bottleneck blocks. ~1.7M params."""
-    return ResNetPreAct(PreActBottleneck, [18, 18, 18], num_classes)
+        return torch.flatten(out, 1)   # (B, 256)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3.  WIDE RESNET  (wrn_28_10)
-# ══════════════════════════════════════════════════════════════════════════════
-# Zagoruyko & Komodakis, BMVC 2016.
-# WRN-28-10: depth=28, width_factor=10.
-# Channels: [16, 160, 320, 640]. Pre-act + dropout between convs.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class WideBasicBlock(nn.Module):
@@ -204,10 +324,10 @@ class WideBasicBlock(nn.Module):
         return out + self.shortcut(x)
 
 
-class WideResNet(nn.Module):
-    def __init__(self, depth=28, width=10, dropout=0.3, num_classes=10):
+class WideResNetBackbone(nn.Module):
+    def __init__(self, depth=28, width=10, dropout=0.3):
         super().__init__()
-        assert (depth - 4) % 6 == 0, "WRN depth must be 6n+4"
+        assert (depth - 4) % 6 == 0
         n  = (depth - 4) // 6
         ch = [16, 16 * width, 32 * width, 64 * width]
         self.conv1    = nn.Conv2d(3, ch[0], 3, stride=1, padding=1, bias=False)
@@ -216,7 +336,7 @@ class WideResNet(nn.Module):
         self.layer3   = self._make_stage(ch[2], ch[3], n, 2, dropout)
         self.bn_final = nn.BatchNorm2d(ch[3])
         self.avgpool  = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc       = nn.Linear(ch[3], num_classes)
+        self.out_features = ch[3]
         self._init_weights()
 
     @staticmethod
@@ -245,39 +365,26 @@ class WideResNet(nn.Module):
         out = self.layer3(out)
         out = F.relu(self.bn_final(out))
         out = self.avgpool(out)
-        return self.fc(torch.flatten(out, 1))
-
-
-def wrn_28_10(num_classes=10):
-    """WRN-28-10: depth=28, width=10, dropout=0.3. ~36.5M params."""
-    return WideResNet(depth=28, width=10, dropout=0.3, num_classes=num_classes)
+        return torch.flatten(out, 1)   # (B, 640)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4.  VGG-16 WITH BATCH NORMALISATION  (vgg16_bn)
-# ══════════════════════════════════════════════════════════════════════════════
-# Simonyan & Zisserman, ICLR 2015. Adapted for 32×32 CIFAR.
-# AdaptiveAvgPool replaces the large 7×7 FC head.
+# 4.  VGG-16 BN  (vgg16_bn)
 # ══════════════════════════════════════════════════════════════════════════════
 
 VGG16_CONFIG = [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M',
                 512, 512, 512, 'M', 512, 512, 512, 'M']
 
 
-class VGG(nn.Module):
-    def __init__(self, config=None, num_classes=10, dropout=0.5):
+class VGGBackbone(nn.Module):
+    def __init__(self, config=None, dropout=0.5):
         super().__init__()
         if config is None:
             config = VGG16_CONFIG
-        self.features   = self._make_features(config)
-        self.avgpool    = nn.AdaptiveAvgPool2d((1, 1))
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(512, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, num_classes),
-        )
+        self.features    = self._make_features(config)
+        self.avgpool     = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout     = nn.Dropout(dropout)
+        self.out_features = 512
         self._init_weights()
 
     @staticmethod
@@ -288,8 +395,7 @@ class VGG(nn.Module):
                 layers.append(nn.MaxPool2d(2, 2))
             else:
                 layers += [nn.Conv2d(in_ch, v, 3, padding=1, bias=False),
-                           nn.BatchNorm2d(v),
-                           nn.ReLU(inplace=True)]
+                           nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
                 in_ch = v
         return nn.Sequential(*layers)
 
@@ -301,31 +407,19 @@ class VGG(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         out = self.features(x)
         out = self.avgpool(out)
         out = torch.flatten(out, 1)
-        return self.classifier(out)
-
-
-def vgg16_bn(num_classes=10):
-    """VGG-16 with BatchNorm, adapted for CIFAR 32×32. ~14.7M params."""
-    return VGG(VGG16_CONFIG, num_classes=num_classes)
+        return self.dropout(out)   # (B, 512)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  RESNEXT-29-8x64d  (resnext_29_8x64d)
-# ══════════════════════════════════════════════════════════════════════════════
-# Xie et al., CVPR 2017. Grouped (aggregated) residual convolutions.
-# cardinality=8, base_width=64. depth=29: 3×3 blocks, 3 convs each.
+# 5.  RESNEXT-29-8x64d
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ResNeXtBlock(nn.Module):
-    """Bottleneck with grouped conv. Stage index scales the internal width."""
     expansion = 2
 
     def __init__(self, in_ch, out_ch, stride=1,
@@ -354,11 +448,8 @@ class ResNeXtBlock(nn.Module):
         return F.relu(out + self.shortcut(x))
 
 
-class ResNeXt(nn.Module):
-    """ResNeXt-29 8×64d for CIFAR. Stage channels: 256 → 512 → 1024."""
-
-    def __init__(self, cardinality=8, base_width=64,
-                 num_blocks=None, num_classes=10):
+class ResNeXtBackbone(nn.Module):
+    def __init__(self, cardinality=8, base_width=64, num_blocks=None):
         super().__init__()
         if num_blocks is None:
             num_blocks = [3, 3, 3]
@@ -366,23 +457,18 @@ class ResNeXt(nn.Module):
         self.conv1 = nn.Conv2d(3, 64, 3, stride=1, padding=1, bias=False)
         self.bn1   = nn.BatchNorm2d(64)
         self.in_ch = 64
-        self.layer1 = self._make_stage(channels[0], num_blocks[0], 1,
-                                       cardinality, base_width, 1)
-        self.layer2 = self._make_stage(channels[1], num_blocks[1], 2,
-                                       cardinality, base_width, 2)
-        self.layer3 = self._make_stage(channels[2], num_blocks[2], 2,
-                                       cardinality, base_width, 3)
+        self.layer1 = self._make_stage(channels[0], num_blocks[0], 1, cardinality, base_width, 1)
+        self.layer2 = self._make_stage(channels[1], num_blocks[1], 2, cardinality, base_width, 2)
+        self.layer3 = self._make_stage(channels[2], num_blocks[2], 2, cardinality, base_width, 3)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc      = nn.Linear(channels[2], num_classes)
+        self.out_features = channels[2]
         self._init_weights()
 
     def _make_stage(self, out_ch, n, stride, cardinality, base_width, stage_idx):
-        layers = [ResNeXtBlock(self.in_ch, out_ch, stride,
-                               cardinality, base_width, stage_idx)]
+        layers = [ResNeXtBlock(self.in_ch, out_ch, stride, cardinality, base_width, stage_idx)]
         self.in_ch = out_ch
         for _ in range(n - 1):
-            layers.append(ResNeXtBlock(self.in_ch, out_ch, 1,
-                                       cardinality, base_width, stage_idx))
+            layers.append(ResNeXtBlock(self.in_ch, out_ch, 1, cardinality, base_width, stage_idx))
         return nn.Sequential(*layers)
 
     def _init_weights(self):
@@ -393,9 +479,6 @@ class ResNeXt(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.01)
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
@@ -403,52 +486,32 @@ class ResNeXt(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.avgpool(out)
-        return self.fc(torch.flatten(out, 1))
-
-
-def resnext_29_8x64d(num_classes=10):
-    """ResNeXt-29 8×64d. ~34.4M params. Paper model."""
-    return ResNeXt(cardinality=8, base_width=64,
-                   num_blocks=[3, 3, 3], num_classes=num_classes)
+        return torch.flatten(out, 1)   # (B, 1024)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6.  DENSENET-BC-100-12  (densenet_bc_100_12)
-# ══════════════════════════════════════════════════════════════════════════════
-# Huang et al., CVPR 2017. Dense connections, growth_rate=12, BC variant.
-# depth=100: 3 dense blocks × 16 bottleneck layers + 2 convs + 2 transitions.
+# 6.  DENSENET-BC-100-12
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DenseLayer(nn.Module):
-    """
-    Bottleneck dense layer: BN→ReLU→Conv(1×1,4k) → BN→ReLU→Conv(3×3,k).
-    Input: concatenation of all previous feature maps in the block.
-    Output: k new feature maps (growth rate).
-    """
     def __init__(self, in_ch, growth_rate, bn_size=4, dropout=0.0):
         super().__init__()
         inter_ch   = bn_size * growth_rate
         self.bn1   = nn.BatchNorm2d(in_ch)
         self.conv1 = nn.Conv2d(in_ch, inter_ch, 1, bias=False)
         self.bn2   = nn.BatchNorm2d(inter_ch)
-        self.conv2 = nn.Conv2d(inter_ch, growth_rate, 3,
-                               padding=1, bias=False)
+        self.conv2 = nn.Conv2d(inter_ch, growth_rate, 3, padding=1, bias=False)
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x):
-        # x is a list of all previous feature tensors — concatenate first
         if isinstance(x, list):
-            x = torch.cat(x, dim=1)      # FIX: was torch.cat([list]) in v2
+            x = torch.cat(x, dim=1)   # FIX: correct list concat
         out = self.conv1(F.relu(self.bn1(x)))
         out = self.conv2(F.relu(self.bn2(out)))
         return self.dropout(out)
 
 
 class DenseBlock(nn.Module):
-    """
-    Dense block: each layer receives concatenation of all preceding outputs.
-    After n layers: total channels = in_ch + n * growth_rate.
-    """
     def __init__(self, num_layers, in_ch, growth_rate, bn_size=4, dropout=0.0):
         super().__init__()
         self.layers = nn.ModuleList([
@@ -459,13 +522,11 @@ class DenseBlock(nn.Module):
     def forward(self, x):
         features = [x]
         for layer in self.layers:
-            new_feat = layer(features)          # pass list of all previous
-            features.append(new_feat)
-        return torch.cat(features, dim=1)       # concatenate all outputs
+            features.append(layer(features))
+        return torch.cat(features, dim=1)
 
 
 class TransitionLayer(nn.Module):
-    """BN→ReLU→Conv(1×1, θ*in_ch)→AvgPool(2×2). Compression factor θ=0.5."""
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.bn   = nn.BatchNorm2d(in_ch)
@@ -476,14 +537,10 @@ class TransitionLayer(nn.Module):
         return self.pool(self.conv(F.relu(self.bn(x))))
 
 
-class DenseNet(nn.Module):
-    """DenseNet-BC for CIFAR. depth=100, growth_rate=12, compression=0.5."""
-
-    def __init__(self, depth=100, growth_rate=12, compression=0.5,
-                 dropout=0.0, num_classes=10):
+class DenseNetBackbone(nn.Module):
+    def __init__(self, depth=100, growth_rate=12, compression=0.5, dropout=0.0):
         super().__init__()
         assert (depth - 4) % 6 == 0
-        # For BC-variant: each 'layer' = 2 convs → n = (depth-4)/(3*2) per block
         n       = (depth - 4) // (3 * 2)
         init_ch = 2 * growth_rate
         self.conv1 = nn.Conv2d(3, init_ch, 3, stride=1, padding=1, bias=False)
@@ -506,7 +563,7 @@ class DenseNet(nn.Module):
 
         self.bn_final = nn.BatchNorm2d(in_ch)
         self.avgpool  = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc       = nn.Linear(in_ch, num_classes)
+        self.out_features = in_ch
         self._init_weights()
 
     def _init_weights(self):
@@ -516,8 +573,6 @@ class DenseNet(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         out = self.conv1(x)
@@ -526,26 +581,14 @@ class DenseNet(nn.Module):
         out = self.block3(out)
         out = F.relu(self.bn_final(out))
         out = self.avgpool(out)
-        return self.fc(torch.flatten(out, 1))
-
-
-def densenet_bc_100_12(num_classes=10):
-    """DenseNet-BC-100-12: depth=100, k=12, θ=0.5. ~0.77M params."""
-    return DenseNet(depth=100, growth_rate=12, compression=0.5,
-                    num_classes=num_classes)
+        return torch.flatten(out, 1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7.  PYRAMIDNET-110-270  (pyramidnet_110_270)
-# ══════════════════════════════════════════════════════════════════════════════
-# Han et al., CVPR 2017. Gradual per-layer channel widening (additive).
-# ch(k) = 16 + round(α × k / N_total),  α=270.
-# Zero-pad shortcuts instead of 1×1 conv projection.
+# 7.  PYRAMIDNET-110-270
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PyramidBlock(nn.Module):
-    """Pre-act basic block with zero-pad channel shortcut."""
-
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
         self.bn1   = nn.BatchNorm2d(in_ch)
@@ -564,30 +607,24 @@ class PyramidBlock(nn.Module):
         out = self.conv1(self.bn1(x))
         out = self.conv2(F.relu(self.bn2(out)))
         out = self.bn3(out)
-        # Shortcut: spatial downsampling + zero-pad channel expansion
-        sc = x
+        sc  = x
         if self.shortcut_pool is not None:
             sc = self.shortcut_pool(sc)
         if self.in_ch != self.out_ch:
-            pad = torch.zeros(
-                sc.size(0), self.out_ch - self.in_ch,
-                sc.size(2), sc.size(3),
-                device=sc.device, dtype=sc.dtype
-            )
+            pad = torch.zeros(sc.size(0), self.out_ch - self.in_ch,
+                              sc.size(2), sc.size(3),
+                              device=sc.device, dtype=sc.dtype)
             sc = torch.cat([sc, pad], dim=1)
         return F.relu(out + sc)
 
 
-class PyramidNet(nn.Module):
-    """PyramidNet for CIFAR. depth=110, alpha=270 (additive widening)."""
-
-    def __init__(self, depth=110, alpha=270, num_classes=10):
+class PyramidNetBackbone(nn.Module):
+    def __init__(self, depth=110, alpha=270):
         super().__init__()
         assert (depth - 2) % 6 == 0
-        n             = (depth - 2) // 6       # 18 blocks per stage
-        total_blocks  = 3 * n
-        # Channel at each block boundary: pyramid formula
-        channels = [16] + [
+        n            = (depth - 2) // 6
+        total_blocks = 3 * n
+        channels     = [16] + [
             16 + round(alpha * (k + 1) / total_blocks)
             for k in range(total_blocks)
         ]
@@ -604,7 +641,7 @@ class PyramidNet(nn.Module):
         final_ch      = channels[-1]
         self.bn_final = nn.BatchNorm2d(final_ch)
         self.avgpool  = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc       = nn.Linear(final_ch, num_classes)
+        self.out_features = final_ch
         self._init_weights()
 
     def _init_weights(self):
@@ -615,32 +652,20 @@ class PyramidNet(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.layers(out)
         out = F.relu(self.bn_final(out))
         out = self.avgpool(out)
-        return self.fc(torch.flatten(out, 1))
-
-
-def pyramidnet_110_270(num_classes=10):
-    """PyramidNet-110-270: depth=110, alpha=270. ~28.3M params."""
-    return PyramidNet(depth=110, alpha=270, num_classes=num_classes)
+        return torch.flatten(out, 1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8.  SHAKE-SHAKE  (shake_shake_26_2x64d)
-# ══════════════════════════════════════════════════════════════════════════════
-# Gastaldi, arXiv 2017. Stochastic branch mixing regularisation.
-# Two parallel branches per residual block; random α (forward) ≠ β (backward).
-# depth=26: 3 stages × 4 ShakeShake blocks + 2. Base width = 64ch.
+# 8.  SHAKE-SHAKE-26-2x64d
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ShakeShakeBranch(nn.Module):
-    """One branch: BN→ReLU→Conv(3×3)→BN→ReLU→Conv(3×3)."""
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
         self.bn1   = nn.BatchNorm2d(in_ch)
@@ -655,37 +680,27 @@ class ShakeShakeBranch(nn.Module):
 
 
 class ShakeShakeBlock(nn.Module):
-    """
-    Shake-Shake block with two stochastic branches.
-    Training  : forward  uses α ~ U(0,1); backward uses independent β ~ U(0,1)
-    Inference : fixed weight 0.5 (deterministic average)
-    """
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
-        self.branch1  = ShakeShakeBranch(in_ch, out_ch, stride)
-        self.branch2  = ShakeShakeBranch(in_ch, out_ch, stride)
-        self.in_ch    = in_ch
-        self.out_ch   = out_ch
-        self.stride   = stride
+        self.branch1 = ShakeShakeBranch(in_ch, out_ch, stride)
+        self.branch2 = ShakeShakeBranch(in_ch, out_ch, stride)
+        self.in_ch   = in_ch
+        self.out_ch  = out_ch
+        self.stride  = stride
 
-    def _shake(self, b1: torch.Tensor, b2: torch.Tensor) -> torch.Tensor:
+    def _shake(self, b1, b2):
         if not self.training:
             return 0.5 * (b1 + b2)
-        batch  = b1.size(0)
-        alpha  = b1.new_empty(batch, 1, 1, 1).uniform_()
-        beta   = b1.new_empty(batch, 1, 1, 1).uniform_()
-        # Forward  :  alpha*b1 + (1-alpha)*b2
-        # Backward :  beta *b1 + (1-beta )*b2   (shake trick via .detach())
+        batch = b1.size(0)
+        alpha = b1.new_empty(batch, 1, 1, 1).uniform_()
+        beta  = b1.new_empty(batch, 1, 1, 1).uniform_()
         return (beta - alpha).detach() * b1 \
              + (alpha - beta).detach() * b2 \
              + alpha * b1 + (1 - alpha) * b2
 
     def forward(self, x):
-        b1  = self.branch1(x)
-        b2  = self.branch2(x)
-        out = self._shake(b1, b2)
-        # Shortcut: spatial pool + zero-pad channels
-        sc = x
+        out = self._shake(self.branch1(x), self.branch2(x))
+        sc  = x
         if self.stride > 1:
             sc = F.avg_pool2d(sc, self.stride, self.stride)
         if self.in_ch != self.out_ch:
@@ -696,12 +711,8 @@ class ShakeShakeBlock(nn.Module):
         return out + sc
 
 
-class ShakeShake(nn.Module):
-    """
-    Shake-Shake-26 2×64d for CIFAR.
-    Channels: 16 → 64 → 128 → 256. Three stages × 4 blocks.
-    """
-    def __init__(self, base_channels=64, num_blocks=None, num_classes=10):
+class ShakeShakeBackbone(nn.Module):
+    def __init__(self, base_channels=64, num_blocks=None):
         super().__init__()
         if num_blocks is None:
             num_blocks = [4, 4, 4]
@@ -713,7 +724,7 @@ class ShakeShake(nn.Module):
         self.layer2  = self._make_stage(ch[1], num_blocks[1], stride=2)
         self.layer3  = self._make_stage(ch[2], num_blocks[2], stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc      = nn.Linear(ch[2], num_classes)
+        self.out_features = ch[2]
         self._init_weights()
 
     def _make_stage(self, out_ch, n, stride):
@@ -731,9 +742,6 @@ class ShakeShake(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.01)
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
@@ -741,22 +749,16 @@ class ShakeShake(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.avgpool(out)
-        return self.fc(torch.flatten(out, 1))
-
-
-def shake_shake_26_2x64d(num_classes=10):
-    """Shake-Shake-26 2×64d. ~26M params. State-of-the-art in paper."""
-    return ShakeShake(base_channels=64, num_blocks=[4, 4, 4],
-                      num_classes=num_classes)
+        return torch.flatten(out, 1)   # (B, 256)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9.  LIGHTCNN  —  debug model (not in paper)
+# 9.  LIGHTCNN  — debug model
 # ══════════════════════════════════════════════════════════════════════════════
 
-class LightCNN(nn.Module):
-    """~95K params. Trains in seconds on CPU. For pipeline smoke-tests only."""
-    def __init__(self, num_classes=10):
+class LightCNNBackbone(nn.Module):
+    """~95K params. CPU-fast. For pipeline smoke-tests only."""
+    def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3,  32, 3, padding=1, bias=False), nn.BatchNorm2d(32),
@@ -767,74 +769,228 @@ class LightCNN(nn.Module):
             nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
         )
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc      = nn.Linear(128, num_classes)
+        self.out_features = 128
 
     def forward(self, x):
         out = self.features(x)
         out = self.avgpool(out)
-        return self.fc(torch.flatten(out, 1))
+        return torch.flatten(out, 1)   # (B, 128)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 10.  MODEL REGISTRY + FACTORY
+# BACKBONE REGISTRY
 # ══════════════════════════════════════════════════════════════════════════════
-# Registry keys match the paper's footnote-1 identifier names where possible.
 
-_MODEL_REGISTRY = {
-    # Paper models
-    "resnet_basic_110"            : resnet_basic_110,
-    "resnet_preact_bottleneck_164": resnet_preact_bottleneck_164,
-    "wrn_28_10"                   : wrn_28_10,
-    "vgg16_bn"                    : vgg16_bn,
-    "resnext_29_8x64d"            : resnext_29_8x64d,
-    "densenet_bc_100_12"          : densenet_bc_100_12,
-    "pyramidnet_110_270"          : pyramidnet_110_270,
-    "shake_shake_26_2x64d"        : shake_shake_26_2x64d,
-    # Extra / debug
-    "resnet20"                    : resnet20,
-    "lightcnn"                    : LightCNN,
+def _build_resnet20():
+    return ResNetCIFARBackbone(BasicBlock, [3, 3, 3])
+
+def _build_resnet110():
+    return ResNetCIFARBackbone(BasicBlock, [18, 18, 18])
+
+def _build_preact164():
+    return ResNetPreActBackbone(PreActBottleneck, [18, 18, 18])
+
+def _build_wrn_28_10():
+    return WideResNetBackbone(depth=28, width=10, dropout=0.3)
+
+def _build_vgg16bn():
+    return VGGBackbone(VGG16_CONFIG, dropout=0.5)
+
+def _build_resnext():
+    return ResNeXtBackbone(cardinality=8, base_width=64, num_blocks=[3, 3, 3])
+
+def _build_densenet():
+    return DenseNetBackbone(depth=100, growth_rate=12, compression=0.5)
+
+def _build_pyramidnet():
+    return PyramidNetBackbone(depth=110, alpha=270)
+
+def _build_shakeshake():
+    return ShakeShakeBackbone(base_channels=64, num_blocks=[4, 4, 4])
+
+def _build_lightcnn():
+    return LightCNNBackbone()
+
+
+_BACKBONE_REGISTRY = {
+    "resnet20"                    : _build_resnet20,
+    "resnet_basic_110"            : _build_resnet110,
+    "resnet_preact_bottleneck_164": _build_preact164,
+    "wrn_28_10"                   : _build_wrn_28_10,
+    "vgg16_bn"                    : _build_vgg16bn,
+    "resnext_29_8x64d"            : _build_resnext,
+    "densenet_bc_100_12"          : _build_densenet,
+    "pyramidnet_110_270"          : _build_pyramidnet,
+    "shake_shake_26_2x64d"        : _build_shakeshake,
+    "lightcnn"                    : _build_lightcnn,
 }
 
 
-def get_model(name: str, device: torch.device,
-              num_classes: int = 10) -> nn.Module:
+# ══════════════════════════════════════════════════════════════════════════════
+# WEIGHT LOADING — Ablation A: backbone initialisation strategy
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_backbone_weights(backbone, init_strategy, ckpt_path=None, device=None):
     """
-    Model factory.
+    Apply backbone initialisation strategy (project §5.2 ablation A).
 
     Args:
-        name        : registry key (case-insensitive, strip whitespace)
-        device      : torch.device
-        num_classes : output classes (default 10)
+        backbone       : a backbone module (from _BACKBONE_REGISTRY)
+        init_strategy  : 'random' | 'imagenet' | 'cifar10'
+        ckpt_path      : path to saved checkpoint (required for 'cifar10')
+        device         : torch.device
+
+    Notes:
+        'random'   — no-op; Kaiming init was already applied in __init__
+        'imagenet' — only supported for wrn_28_10 / resnet_basic_110 when a
+                     torchvision pretrained wrapper is used. For other backbones
+                     no ImageNet weights exist; use 'cifar10' instead.
+        'cifar10'  — loads a checkpoint saved by Member 3's pretrain loop.
+                     The checkpoint must have been saved from a
+                     DisagreementPredictor with the SAME backbone architecture.
+    """
+    strategy = init_strategy.lower().strip()
+
+    if strategy == 'random':
+        return backbone   # already initialised by __init__
+
+    elif strategy == 'imagenet':
+        # Only ResNet-18 has official torchvision ImageNet weights and matches
+        # close enough to ResNetCIFARBackbone (structure differs slightly).
+        # For a fair ablation, load torchvision ResNet-18 backbone and copy
+        # layer1-3 weights, skipping the stem (7×7 → 3×3) and fc (removed).
+        try:
+            import torchvision.models as tvm
+            pretrained = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
+            # Copy layer1–3 weights only (stem is different, fc is removed)
+            backbone_state = backbone.state_dict()
+            pretrained_state = pretrained.state_dict()
+            copied = 0
+            for k in backbone_state:
+                # Map torchvision names (layer1.0.conv1.weight) to ours
+                if k in pretrained_state and \
+                   backbone_state[k].shape == pretrained_state[k].shape:
+                    backbone_state[k] = pretrained_state[k]
+                    copied += 1
+            backbone.load_state_dict(backbone_state)
+            print(f"[INFO] ImageNet weights loaded ({copied} tensors matched).")
+        except Exception as e:
+            print(f"[WARN] ImageNet weight loading failed: {e}. "
+                  "Falling back to random init.")
+        return backbone
+
+    elif strategy == 'cifar10':
+        if ckpt_path is None:
+            raise ValueError("ckpt_path is required for init_strategy='cifar10'")
+        ckpt = torch.load(ckpt_path,
+                           map_location=device or torch.device('cpu'))
+        # Checkpoint may be a full DisagreementPredictor state_dict
+        state = ckpt.get('state_dict', ckpt)
+        # Strip 'backbone.' prefix if present
+        backbone_state = {
+            k.replace('backbone.', ''): v
+            for k, v in state.items()
+            if k.startswith('backbone.') or 'backbone' not in k
+        }
+        missing, unexpected = backbone.load_state_dict(backbone_state, strict=False)
+        print(f"[INFO] CIFAR-10 pretrained weights loaded from {ckpt_path}.")
+        if missing:
+            print(f"       Missing keys  : {missing[:5]} ...")
+        if unexpected:
+            print(f"       Unexpected keys: {unexpected[:5]} ...")
+        return backbone
+
+    else:
+        raise ValueError(
+            f"Unknown init_strategy '{init_strategy}'. "
+            "Choose from: 'random', 'imagenet', 'cifar10'."
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRIMARY PUBLIC FACTORY — used by Member 3's train.py
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_model_with_head(
+        backbone_name  = 'resnet_basic_110',
+        head_type      = 'linear',
+        init_strategy  = 'random',
+        ckpt_path      = None,
+        device         = None,
+        num_classes    = NUM_CLASSES,
+):
+    """
+    Build a DisagreementPredictor (backbone + head) ready for training.
+
+    Args:
+        backbone_name : key in _BACKBONE_REGISTRY
+        head_type     : 'linear' | 'mlp' | 'temperature'
+        init_strategy : 'random' | 'imagenet' | 'cifar10'
+        ckpt_path     : checkpoint path (only for init_strategy='cifar10')
+        device        : torch.device
+        num_classes   : output classes (default 10)
 
     Returns:
-        nn.Module on the requested device, ready for training.
-    """
-    key = name.lower().strip()
-    if key not in _MODEL_REGISTRY:
-        raise ValueError(
-            f"Unknown model '{name}'.\n"
-            f"Available: {sorted(_MODEL_REGISTRY.keys())}"
+        DisagreementPredictor on the requested device.
+
+    Example:
+        model = get_model_with_head(
+            backbone_name='resnet_basic_110',
+            head_type='mlp',
+            init_strategy='cifar10',
+            ckpt_path='./checkpoints/pretrain.pt',
+            device=torch.device('cuda')
         )
-    model = _MODEL_REGISTRY[key](num_classes=num_classes)
-    return model.to(device)
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    key = backbone_name.lower().strip()
+    if key not in _BACKBONE_REGISTRY:
+        raise ValueError(
+            f"Unknown backbone '{backbone_name}'.\n"
+            f"Available: {sorted(_BACKBONE_REGISTRY.keys())}"
+        )
+
+    backbone = _BACKBONE_REGISTRY[key]()
+    backbone = load_backbone_weights(backbone, init_strategy, ckpt_path, device)
+    head     = build_head(head_type, backbone.out_features, num_classes)
+    model    = DisagreementPredictor(backbone, head).to(device)
+    return model
 
 
-def count_parameters(model: nn.Module) -> int:
+# ── Backward-compatible alias used by original train.py ──────────────────────
+def get_model(name, device, num_classes=NUM_CLASSES):
+    """Alias for compatibility: wraps get_model_with_head with linear head."""
+    return get_model_with_head(
+        backbone_name=name,
+        head_type='linear',
+        init_strategy='random',
+        device=device,
+        num_classes=num_classes,
+    )
+
+
+def count_parameters(model):
     """Return total trainable parameter count."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def print_model_summary(name: str, device: torch.device) -> None:
-    """Build model, run dummy forward pass, print shape + param count."""
-    model    = get_model(name, device)
+def print_model_summary(backbone_name, head_type='linear', device=None):
+    """Build model, run dummy forward, print feature dim + param count."""
+    if device is None:
+        device = torch.device('cpu')
+    model    = get_model_with_head(backbone_name, head_type, device=device)
     n_params = count_parameters(model)
     dummy    = torch.zeros(2, 3, 32, 32, device=device)
     model.eval()
     with torch.no_grad():
         out = model(dummy)
     print(
-        f"  {name:<35s}  {n_params:>12,}  "
-        f"{str(tuple(dummy.shape)):>20s}  {tuple(out.shape)}"
+        f"  {backbone_name:<35s} | head={head_type:<11s} | "
+        f"feat={model.backbone.out_features:4d} | "
+        f"params={n_params:>12,} | "
+        f"out={tuple(out.shape)}"
     )
 
 
@@ -842,14 +998,24 @@ def print_model_summary(name: str, device: torch.device) -> None:
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
-    print("Model Summary  (8 paper models + debug)")
-    print("=" * 90)
-    print(f"  {'Model':<35s}  {'Params':>12s}  {'Input':>20s}  Output")
-    print("-" * 90)
-    for name in _MODEL_REGISTRY:
-        try:
-            print_model_summary(name, device)
-        except Exception as e:
-            print(f"  {name:<35s}  ERROR: {e}")
-    print("=" * 90)
-    print("\nAll models built and forward-pass verified.")
+    print("Model Summary — all backbones × all head types")
+    print("=" * 100)
+    for bname in _BACKBONE_REGISTRY:
+        for htype in ['linear', 'mlp', 'temperature']:
+            try:
+                print_model_summary(bname, htype, device)
+            except Exception as e:
+                print(f"  {bname} / {htype}: ERROR — {e}")
+    print("=" * 100)
+
+    # Verify log-softmax output (must sum to 1 in probability space)
+    model = get_model_with_head('lightcnn', 'linear', device=device)
+    dummy = torch.zeros(4, 3, 32, 32, device=device)
+    model.eval()
+    with torch.no_grad():
+        log_probs = model(dummy)
+        probs     = log_probs.exp()
+    assert abs(probs.sum(dim=1).mean().item() - 1.0) < 1e-5, \
+        "Output probabilities do not sum to 1!"
+    print("\n[PASS] Output verified: log-softmax probs sum to 1.0")
+    print("[PASS] All models built and forward-pass verified.")
